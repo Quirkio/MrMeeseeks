@@ -18,6 +18,7 @@ Carnet: 2024089190
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <semaphore.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -30,6 +31,8 @@ Carnet: 2024089190
 #define TEXT_TASK_TIMEOUT_SECONDS 300
 #define TEXT_TASK_PROCESS_LIMIT 128
 #define TEXT_TASK_MAX_DEPTH 8
+#define DEFAULT_SIMULATION_MIN_SECONDS 0.5
+#define DEFAULT_SIMULATION_MAX_SECONDS 5.0
 
 typedef enum {
     TASK_TEXT = 1,
@@ -73,6 +76,11 @@ enum {
     TASK_PROCESS_LIMIT,
     TASK_IMPOSSIBLE
 };
+
+static double simulation_min_seconds = DEFAULT_SIMULATION_MIN_SECONDS;
+static double simulation_max_seconds = DEFAULT_SIMULATION_MAX_SECONDS;
+static struct timespec box_deadline;
+static volatile sig_atomic_t box_process_group = -1;
 
 void introduce_meeseeks(const MeeseeksInfo *info);
 void say_goodbye(const char *message);
@@ -415,6 +423,35 @@ static double random_percentage(void)
     return 100.0 * (double)rand() / ((double)RAND_MAX + 1.0);
 }
 
+// Terminates the isolated Box process group when its universal countdown expires.
+static void planetary_chaos_handler(int signal_number)
+{
+    static const char message[] =
+        "\nBox: Planetary chaos! The five-minute limit expired; terminating Box and all Meeseeks.\n";
+    (void)signal_number;
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    if (box_process_group > 0) (void)kill(-box_process_group, SIGKILL);
+    _exit(128 + SIGALRM);
+}
+
+// Prints the monotonic-time countdown remaining before planetary chaos.
+static void print_time_remaining(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("Box: clock_gettime");
+        return;
+    }
+
+    double remaining = (double)(box_deadline.tv_sec - now.tv_sec) +
+        (double)(box_deadline.tv_nsec - now.tv_nsec) / 1000000000.0;
+    if (remaining < 0.0) remaining = 0.0;
+    unsigned long seconds = (unsigned long)remaining;
+    if ((double)seconds < remaining) seconds++;
+    printf("Time until planetary chaos: %lu:%02lu remaining.\n",
+           seconds / 60, seconds % 60);
+}
+
 // Seeds each process independently so forked workers do not share random outcomes.
 static void seed_random_generator(void)
 {
@@ -425,17 +462,21 @@ static void seed_random_generator(void)
     srand(seed);
 }
 
-// Waits for the simulated task duration in short intervals so workers notice cancellation.
-static int simulate_task_time(SharedTaskState *shared)
+// Waits for a configured simulated duration and reports actual elapsed wall time.
+static int simulate_task_time(SharedTaskState *shared, double *elapsed_seconds)
 {
     struct timespec now;
+    struct timespec start;
     struct timespec finish;
-    double delay = 0.5 + random_percentage() / 100.0 * 4.5;
+    double delay = simulation_min_seconds +
+        random_percentage() / 100.0 *
+        (simulation_max_seconds - simulation_min_seconds);
 
     if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
         perror("Meeseeks: clock_gettime");
         return -1;
     }
+    start = now;
     finish.tv_sec = now.tv_sec + (time_t)delay;
     finish.tv_nsec = now.tv_nsec +
         (long)((delay - (double)(time_t)delay) * 1000000000.0);
@@ -452,6 +493,8 @@ static int simulate_task_time(SharedTaskState *shared)
         }
         if (now.tv_sec > finish.tv_sec ||
             (now.tv_sec == finish.tv_sec && now.tv_nsec >= finish.tv_nsec)) {
+            *elapsed_seconds = (double)(now.tv_sec - start.tv_sec) +
+                (double)(now.tv_nsec - start.tv_nsec) / 1000000000.0;
             return 0;
         }
         remaining.tv_sec = finish.tv_sec - now.tv_sec;
@@ -467,6 +510,12 @@ static int simulate_task_time(SharedTaskState *shared)
         while (nanosleep(&remaining, &remaining) == -1 && errno == EINTR) {
         }
     }
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("Meeseeks: clock_gettime");
+        return -1;
+    }
+    *elapsed_seconds = (double)(now.tv_sec - start.tv_sec) +
+        (double)(now.tv_nsec - start.tv_nsec) / 1000000000.0;
     return 1;
 }
 
@@ -625,12 +674,19 @@ int run_text_task(const TaskMessage *message, MeeseeksInfo info,
         printf("Mr. Meeseeks (pid=%ld, ppid=%ld): Working on \"%s\" "
                "(difficulty %.4f).\n",
                (long)getpid(), (long)getppid(), message->request, message->difficulty);
-        int wait_result = simulate_task_time(shared);
+        double attempt_seconds = 0.0;
+        int wait_result = simulate_task_time(shared, &attempt_seconds);
         if (wait_result != 0) {
+            printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+                   "This attempt took %.3f seconds.\n",
+                   (long)getpid(), (long)getppid(), attempt_seconds);
             reason = task_stop_reason(shared);
             return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
         }
         if (random_percentage() < message->difficulty) {
+            printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+                   "I completed my attempt in %.3f seconds.\n",
+                   (long)getpid(), (long)getppid(), attempt_seconds);
             publish_solution(shared, &info);
             reason = task_stop_reason(shared);
             return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -643,8 +699,10 @@ int run_text_task(const TaskMessage *message, MeeseeksInfo info,
                                              &total_progress);
         if (completed < 0) return EXIT_FAILURE;
         printf("Mr. Meeseeks (pid=%ld, ppid=%ld): I couldn't finish it, "
-               "but I completed %.2f%% of it (total progress: %.2f%%).\n",
-               (long)getpid(), (long)getppid(), contribution, total_progress);
+               "but I completed %.2f%% of it (total progress: %.2f%%) "
+               "in %.3f seconds.\n",
+               (long)getpid(), (long)getppid(), contribution, total_progress,
+               attempt_seconds);
         if (completed > 0) return EXIT_SUCCESS;
 
         reason = task_stop_reason(shared);
@@ -908,6 +966,67 @@ int read_line(const char *prompt, char *buffer, size_t capacity)
     return 1;
 }
 
+// Reads and validates one nonnegative simulation duration in seconds.
+static int read_simulation_seconds(const char *prompt, double *seconds)
+{
+    char input[64];
+    char *end;
+    if (read_line(prompt, input, sizeof(input)) <= 0) return -1;
+
+    errno = 0;
+    *seconds = strtod(input, &end);
+    while (isspace((unsigned char)*end)) end++;
+    if (end == input || *end != '\0' || errno == ERANGE ||
+        !isfinite(*seconds) || *seconds < 0.0 ||
+        *seconds > TEXT_TASK_TIMEOUT_SECONDS) {
+        puts("Box: Enter a finite duration between 0 and 300 seconds.");
+        return -1;
+    }
+    return 0;
+}
+
+// Lets the user set simulation bounds or restore the default 0.5-to-5-second range.
+static void configure_simulation_time(void)
+{
+    char choice[32];
+    for (;;) {
+        puts("\nSimulation duration settings:");
+        printf("Current range: %.3f to %.3f seconds.\n",
+               simulation_min_seconds, simulation_max_seconds);
+        print_time_remaining();
+        puts("  1) Set minimum and maximum");
+        puts("  2) Restore defaults (0.5 to 5 seconds)");
+        puts("  3) Return to main menu");
+        if (read_line("Box settings> ", choice, sizeof(choice)) <= 0) return;
+
+        if (strcmp(choice, "1") == 0) {
+            double minimum;
+            double maximum;
+            if (read_simulation_seconds("Minimum seconds: ", &minimum) < 0 ||
+                read_simulation_seconds("Maximum seconds: ", &maximum) < 0) {
+                continue;
+            }
+            if (minimum > maximum) {
+                puts("Box: Minimum duration cannot exceed maximum duration.");
+                continue;
+            }
+            simulation_min_seconds = minimum;
+            simulation_max_seconds = maximum;
+            printf("Box: Simulation duration set to %.3f-%.3f seconds.\n",
+                   simulation_min_seconds, simulation_max_seconds);
+        } else if (strcmp(choice, "2") == 0) {
+            simulation_min_seconds = DEFAULT_SIMULATION_MIN_SECONDS;
+            simulation_max_seconds = DEFAULT_SIMULATION_MAX_SECONDS;
+            puts("Box: Simulation duration restored to 0.5-5 seconds.");
+        } else if (strcmp(choice, "3") == 0 ||
+                   strcmp(choice, "q") == 0 || strcmp(choice, "Q") == 0) {
+            return;
+        } else {
+            puts("Box: Choose 1, 2, or 3.");
+        }
+    }
+}
+
 // Collects a text task and difficulty, initializes shared controls, and waits for its tree.
 static void start_text_request(void)
 {
@@ -966,16 +1085,12 @@ static void start_text_request(void)
         (void)munmap(shared, sizeof(*shared));
         return;
     }
-    if (clock_gettime(CLOCK_MONOTONIC, &shared->deadline) == -1) {
-        perror("Box: clock_gettime");
-        (void)sem_destroy(&shared->mutex);
-        (void)munmap(shared, sizeof(*shared));
-        return;
-    }
-    shared->deadline.tv_sec += TEXT_TASK_TIMEOUT_SECONDS;
+    shared->deadline = box_deadline;
     shared->stop_reason = TASK_RUNNING;
-    printf("Box: This task has a %d-second deadline and a %d-process safety cap.\n",
-           TEXT_TASK_TIMEOUT_SECONDS, TEXT_TASK_PROCESS_LIMIT);
+    printf("Box: Simulation duration is %.3f-%.3f seconds; this request shares "
+           "the Box five-minute deadline and has a %d-process safety cap.\n",
+           simulation_min_seconds, simulation_max_seconds,
+           TEXT_TASK_PROCESS_LIMIT);
 
     (void)create_meeseeks(&message,
                           (MeeseeksInfo){ .level = 1, .instance = 1 }, shared);
@@ -987,9 +1102,27 @@ static void start_text_request(void)
 int main(void)
 {
     char choice[32];
+    struct sigaction chaos_action = { 0 };
 
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (setpgid(0, 0) == -1 && getpgrp() != getpid()) {
+        perror("Box: couldn't create an isolated process group");
+        return EXIT_FAILURE;
+    }
+    box_process_group = (sig_atomic_t)getpgrp();
+    if (clock_gettime(CLOCK_MONOTONIC, &box_deadline) == -1) {
+        perror("Box: clock_gettime");
+        return EXIT_FAILURE;
+    }
+    box_deadline.tv_sec += TEXT_TASK_TIMEOUT_SECONDS;
+    chaos_action.sa_handler = planetary_chaos_handler;
+    sigemptyset(&chaos_action.sa_mask);
+    if (sigaction(SIGALRM, &chaos_action, NULL) == -1) {
+        perror("Box: sigaction");
+        return EXIT_FAILURE;
+    }
+    alarm(TEXT_TASK_TIMEOUT_SECONDS);
     seed_random_generator();
     puts("=== Mr. Meeseeks Box ===");
 
@@ -999,7 +1132,9 @@ int main(void)
         puts("  2) Calculation");
         puts("  3) External program");
         puts("  4) Quit");
+        puts("  5) Configure simulation duration");
         puts("  q) Quit anytime");
+        print_time_remaining();
 
         if (read_line("Box> ", choice, sizeof(choice)) <= 0) break;
         if (strcmp(choice, "1") == 0) {
@@ -1011,11 +1146,13 @@ int main(void)
             (void)create_meeseeks(&message,
                                   (MeeseeksInfo){ .level = 1, .instance = 1 },
                                   NULL);
+        } else if (strcmp(choice, "5") == 0) {
+            configure_simulation_time();
         } else if (strcmp(choice, "4") == 0 ||
                    strcmp(choice, "q") == 0 || strcmp(choice, "Q") == 0) {
             break;
         } else {
-            puts("Box: Please choose 1, 2, 3, 4, or q.");
+            puts("Box: Please choose 1, 2, 3, 4, 5, or q.");
         }
     }
 
