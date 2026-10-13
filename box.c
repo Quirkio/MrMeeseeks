@@ -1,15 +1,35 @@
+/*
+Instituto Tecnológico de Costa Rica
+Escuela de Ingeniería en Computación
+
+IC6600 Sistemas Operativos - Proferos Esteban Arias
+Tarea #3
+
+José Ignacio Madriz Ortiz
+Carnet: 2024089190
+*/
+
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <semaphore.h>
+#include <time.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define MAX_REQUEST_LENGTH 1024
 #define MAX_OPERANDS 256
+#define TEXT_TASK_TIMEOUT_SECONDS 300
+#define TEXT_TASK_PROCESS_LIMIT 128
+#define TEXT_TASK_MAX_DEPTH 8
 
 typedef enum {
     TASK_TEXT = 1,
@@ -20,6 +40,7 @@ typedef enum {
 typedef struct {
     TaskType type;
     char request[MAX_REQUEST_LENGTH];
+    double difficulty;
 } TaskMessage;
 
 typedef struct {
@@ -33,12 +54,33 @@ typedef struct {
     size_t count;
 } ParsedExpression;
 
+typedef struct {
+    sem_t mutex;
+    struct timespec deadline;
+    unsigned int created_count;
+    int stop_reason;
+    double progress_percent;
+    pid_t winner_pid;
+    pid_t winner_ppid;
+    unsigned int winner_level;
+    unsigned int winner_instance;
+} SharedTaskState;
+
+enum {
+    TASK_RUNNING,
+    TASK_SOLVED,
+    TASK_TIMED_OUT,
+    TASK_PROCESS_LIMIT,
+    TASK_IMPOSSIBLE
+};
+
 void introduce_meeseeks(const MeeseeksInfo *info);
 void say_goodbye(const char *message);
 int write_message(int fd, const TaskMessage *message);
 int read_message(int fd, TaskMessage *message);
 int handle_request(const TaskMessage *message);
-int create_meeseeks(const TaskMessage *message, MeeseeksInfo info);
+int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
+                    SharedTaskState *shared);
 int read_line(const char *prompt, char *buffer, size_t capacity);
 
 int parse_arithmetic(const char *text, ParsedExpression *parsed,
@@ -49,6 +91,8 @@ int evaluate_arithmetic(const ParsedExpression *parsed, double *result,
                         const char **error);
 int evaluate_logical(const ParsedExpression *parsed, int *result,
                      const char **error);
+int run_text_task(const TaskMessage *message, MeeseeksInfo info,
+                  SharedTaskState *shared);
 
 // Reads alternating numeric operands and arithmetic operators into parsed.
 int parse_arithmetic(const char *text, ParsedExpression *parsed,
@@ -235,6 +279,384 @@ int evaluate_logical(const ParsedExpression *parsed, int *result,
     return 0;
 }
 
+// Acquires the process-shared lock, retrying if a signal interrupts sem_wait.
+static int lock_task_state(SharedTaskState *shared)
+{
+    while (sem_wait(&shared->mutex) == -1) {
+        if (errno != EINTR) {
+            perror("Meeseeks: sem_wait");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Releases the lock protecting counters, deadline state, and the winner record.
+static int unlock_task_state(SharedTaskState *shared)
+{
+    if (sem_post(&shared->mutex) == -1) {
+        perror("Meeseeks: sem_post");
+        return -1;
+    }
+    return 0;
+}
+
+// Checks shared cancellation state and marks the request timed out at its deadline.
+static int task_stop_reason(SharedTaskState *shared)
+{
+    struct timespec now;
+    int reason;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("Meeseeks: clock_gettime");
+        if (lock_task_state(shared) == 0) {
+            if (shared->stop_reason == TASK_RUNNING)
+                shared->stop_reason = TASK_TIMED_OUT;
+            (void)unlock_task_state(shared);
+        }
+        return TASK_TIMED_OUT;
+    }
+    if (lock_task_state(shared) == -1) return TASK_TIMED_OUT;
+    if (shared->stop_reason == TASK_RUNNING &&
+        (now.tv_sec > shared->deadline.tv_sec ||
+         (now.tv_sec == shared->deadline.tv_sec &&
+          now.tv_nsec >= shared->deadline.tv_nsec))) {
+        shared->stop_reason = TASK_TIMED_OUT;
+    }
+    reason = shared->stop_reason;
+    (void)unlock_task_state(shared);
+    return reason;
+}
+
+// Reserves a slot for a fork or stops the request when the process cap is reached.
+static int reserve_process_slot(SharedTaskState *shared)
+{
+    int reserved = 0;
+
+    if (lock_task_state(shared) == -1) return -1;
+    if (shared->stop_reason == TASK_RUNNING &&
+        shared->created_count < TEXT_TASK_PROCESS_LIMIT) {
+        shared->created_count++;
+        reserved = 1;
+    } else if (shared->stop_reason == TASK_RUNNING) {
+        shared->stop_reason = TASK_PROCESS_LIMIT;
+    }
+    (void)unlock_task_state(shared);
+    return reserved;
+}
+
+// Publishes the first successful worker as the result for the whole process tree.
+static void publish_solution(SharedTaskState *shared, const MeeseeksInfo *info)
+{
+    struct timespec now;
+    int clock_ok = clock_gettime(CLOCK_MONOTONIC, &now) == 0;
+
+    if (!clock_ok) perror("Meeseeks: clock_gettime");
+    if (lock_task_state(shared) == -1) return;
+    if (shared->stop_reason == TASK_RUNNING && clock_ok &&
+        (now.tv_sec < shared->deadline.tv_sec ||
+         (now.tv_sec == shared->deadline.tv_sec &&
+          now.tv_nsec < shared->deadline.tv_nsec))) {
+        shared->stop_reason = TASK_SOLVED;
+        shared->winner_pid = getpid();
+        shared->winner_ppid = getppid();
+        shared->winner_level = info->level;
+        shared->winner_instance = info->instance;
+    } else if (shared->stop_reason == TASK_RUNNING) {
+        shared->stop_reason = TASK_TIMED_OUT;
+    }
+    (void)unlock_task_state(shared);
+}
+
+// Adds this worker's contribution and marks the task complete if shared progress reaches 100%.
+static int record_task_progress(SharedTaskState *shared, const MeeseeksInfo *info,
+                               double contribution, double *total_progress)
+{
+    int completed = 0;
+
+    if (lock_task_state(shared) == -1) return -1;
+    if (shared->stop_reason == TASK_RUNNING) {
+        shared->progress_percent += contribution;
+        if (shared->progress_percent > 100.0) shared->progress_percent = 100.0;
+        *total_progress = shared->progress_percent;
+        if (shared->progress_percent >= 100.0) {
+            shared->stop_reason = TASK_SOLVED;
+            shared->winner_pid = getpid();
+            shared->winner_ppid = getppid();
+            shared->winner_level = info->level;
+            shared->winner_instance = info->instance;
+            completed = 1;
+        }
+    } else {
+        *total_progress = shared->progress_percent;
+    }
+    (void)unlock_task_state(shared);
+    return completed;
+}
+
+// Distinguishes the solver's farewell from helpers cancelled after a sibling wins.
+static const char *text_task_farewell(SharedTaskState *shared, int result)
+{
+    int another_worker_won = 0;
+    if (lock_task_state(shared) == 0) {
+        another_worker_won = shared->stop_reason == TASK_SOLVED &&
+                             shared->winner_pid != getpid();
+        (void)unlock_task_state(shared);
+    }
+    if (another_worker_won) return "Another Meeseeks completed the task. Goodbye!";
+    return result == EXIT_SUCCESS
+        ? "Thanks for the task. I'm glad I could help!"
+        : "I couldn't complete the task. Goodbye!";
+}
+
+// Returns a uniformly distributed random percentage in [0, 100).
+static double random_percentage(void)
+{
+    return 100.0 * (double)rand() / ((double)RAND_MAX + 1.0);
+}
+
+// Seeds each process independently so forked workers do not share random outcomes.
+static void seed_random_generator(void)
+{
+    struct timespec now;
+    unsigned int seed = (unsigned int)getpid();
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        seed ^= (unsigned int)now.tv_nsec;
+    srand(seed);
+}
+
+// Waits for the simulated task duration in short intervals so workers notice cancellation.
+static int simulate_task_time(SharedTaskState *shared)
+{
+    struct timespec now;
+    struct timespec finish;
+    double delay = 0.5 + random_percentage() / 100.0 * 4.5;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("Meeseeks: clock_gettime");
+        return -1;
+    }
+    finish.tv_sec = now.tv_sec + (time_t)delay;
+    finish.tv_nsec = now.tv_nsec +
+        (long)((delay - (double)(time_t)delay) * 1000000000.0);
+    if (finish.tv_nsec >= 1000000000L) {
+        finish.tv_sec++;
+        finish.tv_nsec -= 1000000000L;
+    }
+
+    while (task_stop_reason(shared) == TASK_RUNNING) {
+        struct timespec remaining;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+            perror("Meeseeks: clock_gettime");
+            return -1;
+        }
+        if (now.tv_sec > finish.tv_sec ||
+            (now.tv_sec == finish.tv_sec && now.tv_nsec >= finish.tv_nsec)) {
+            return 0;
+        }
+        remaining.tv_sec = finish.tv_sec - now.tv_sec;
+        remaining.tv_nsec = finish.tv_nsec - now.tv_nsec;
+        if (remaining.tv_nsec < 0) {
+            remaining.tv_sec--;
+            remaining.tv_nsec += 1000000000L;
+        }
+        if (remaining.tv_sec > 0 || remaining.tv_nsec > 100000000L) {
+            remaining.tv_sec = 0;
+            remaining.tv_nsec = 100000000L;
+        }
+        while (nanosleep(&remaining, &remaining) == -1 && errno == EINTR) {
+        }
+    }
+    return 1;
+}
+
+// Forks a child, gives it the task through a private pipe, and returns its PID.
+static pid_t spawn_text_child(const TaskMessage *message, MeeseeksInfo info,
+                              SharedTaskState *shared)
+{
+    int request_pipe[2];
+    pid_t child_pid;
+    int reserved = reserve_process_slot(shared);
+
+    if (reserved <= 0) return -1;
+    if (pipe(request_pipe) == -1) {
+        perror("Meeseeks: pipe");
+        if (lock_task_state(shared) == 0) {
+            if (shared->created_count > 0) shared->created_count--;
+            if (shared->stop_reason == TASK_RUNNING)
+                shared->stop_reason = TASK_PROCESS_LIMIT;
+            (void)unlock_task_state(shared);
+        }
+        return -1;
+    }
+    child_pid = fork();
+    if (child_pid == -1) {
+        perror("Meeseeks: fork");
+        close(request_pipe[0]);
+        close(request_pipe[1]);
+        if (lock_task_state(shared) == 0) {
+            if (shared->created_count > 0) shared->created_count--;
+            if (shared->stop_reason == TASK_RUNNING)
+                shared->stop_reason = TASK_PROCESS_LIMIT;
+            (void)unlock_task_state(shared);
+        }
+        return -1;
+    }
+    if (child_pid == 0) {
+        TaskMessage child_message;
+        int result;
+
+        close(request_pipe[1]);
+        introduce_meeseeks(&info);
+        if (read_message(request_pipe[0], &child_message) == -1) {
+            fprintf(stderr, "Mr. Meeseeks (pid=%ld, ppid=%ld): "
+                    "Couldn't receive the request: %s.\n",
+                    (long)getpid(), (long)getppid(), strerror(errno));
+            close(request_pipe[0]);
+            say_goodbye("I couldn't complete the request. Goodbye!");
+            _exit(EXIT_FAILURE);
+        }
+        close(request_pipe[0]);
+        result = run_text_task(&child_message, info, shared);
+        say_goodbye(text_task_farewell(shared, result));
+        _exit(result);
+    }
+
+    close(request_pipe[0]);
+    if (write_message(request_pipe[1], message) == -1) {
+        perror("Meeseeks: writing child request");
+        close(request_pipe[1]);
+        (void)waitpid(child_pid, NULL, 0);
+        if (lock_task_state(shared) == 0) {
+            if (shared->stop_reason == TASK_RUNNING)
+                shared->stop_reason = TASK_PROCESS_LIMIT;
+            (void)unlock_task_state(shared);
+        }
+        return -1;
+    }
+    close(request_pipe[1]);
+    return child_pid;
+}
+
+// Attempts the task, forks difficulty-based helpers, and propagates any solution upward.
+int run_text_task(const TaskMessage *message, MeeseeksInfo info,
+                  SharedTaskState *shared)
+{
+    pid_t children[5];
+    size_t child_count = 0;
+    int reason = task_stop_reason(shared);
+
+    if (reason != TASK_RUNNING) return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+    seed_random_generator();
+    if (message->difficulty <= 0.0) {
+        if (lock_task_state(shared) == 0) {
+            if (shared->stop_reason == TASK_RUNNING)
+                shared->stop_reason = TASK_IMPOSSIBLE;
+            (void)unlock_task_state(shared);
+        }
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): A difficulty of 0 is impossible.\n",
+               (long)getpid(), (long)getppid());
+        return EXIT_FAILURE;
+    }
+
+    if (message->difficulty <= 85.0) {
+        child_count = message->difficulty <= 45.0 ? 5 : 2;
+        if (info.level >= TEXT_TASK_MAX_DEPTH) {
+            if (lock_task_state(shared) == 0) {
+                if (shared->stop_reason == TASK_RUNNING)
+                    shared->stop_reason = TASK_PROCESS_LIMIT;
+                (void)unlock_task_state(shared);
+            }
+            return EXIT_FAILURE;
+        }
+    }
+
+    for (;;) {
+        size_t spawned_count = 0;
+
+        reason = task_stop_reason(shared);
+        if (reason != TASK_RUNNING)
+            return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+
+        if (child_count > 0) {
+            printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+                   "Difficulty %.2f requires %zu helpers; creating this wave now.\n",
+                   (long)getpid(), (long)getppid(), message->difficulty, child_count);
+            for (size_t i = 0; i < child_count; i++) {
+                TaskMessage child_message = *message;
+                MeeseeksInfo child_info = {
+                    .level = info.level + 1,
+                    .instance = (unsigned int)i + 1
+                };
+                if (task_stop_reason(shared) != TASK_RUNNING) break;
+
+                child_message.difficulty = message->difficulty +
+                    (100.0 - message->difficulty) * 0.35;
+                pid_t child_pid = spawn_text_child(&child_message, child_info, shared);
+                if (child_pid < 0) break;
+                children[spawned_count++] = child_pid;
+            }
+
+            for (size_t i = 0; i < spawned_count; i++) {
+                int status;
+                while (waitpid(children[i], &status, 0) == -1) {
+                    if (errno != EINTR) {
+                        perror("Meeseeks: waitpid");
+                        break;
+                    }
+                }
+            }
+
+            reason = task_stop_reason(shared);
+            if (reason != TASK_RUNNING)
+                return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+            if (spawned_count < child_count) return EXIT_FAILURE;
+
+            if (lock_task_state(shared) == 0) {
+                printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+                       "The wave is reaped; total progress is %.2f%% and the task "
+                       "remains. I will try next; if I cannot finish it, I will "
+                       "create more Meeseeks.\n",
+                       (long)getpid(), (long)getppid(), shared->progress_percent);
+                (void)unlock_task_state(shared);
+            }
+        }
+
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): Working on \"%s\" "
+               "(difficulty %.4f).\n",
+               (long)getpid(), (long)getppid(), message->request, message->difficulty);
+        int wait_result = simulate_task_time(shared);
+        if (wait_result != 0) {
+            reason = task_stop_reason(shared);
+            return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+        if (random_percentage() < message->difficulty) {
+            publish_solution(shared, &info);
+            reason = task_stop_reason(shared);
+            return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+
+        double contribution = 1.0 + message->difficulty * 0.15 *
+            random_percentage() / 100.0;
+        double total_progress = 0.0;
+        int completed = record_task_progress(shared, &info, contribution,
+                                             &total_progress);
+        if (completed < 0) return EXIT_FAILURE;
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): I couldn't finish it, "
+               "but I completed %.2f%% of it (total progress: %.2f%%).\n",
+               (long)getpid(), (long)getppid(), contribution, total_progress);
+        if (completed > 0) return EXIT_SUCCESS;
+
+        reason = task_stop_reason(shared);
+        if (reason != TASK_RUNNING)
+            return reason == TASK_SOLVED ? EXIT_SUCCESS : EXIT_FAILURE;
+        if (child_count == 0) return EXIT_FAILURE;
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): I couldn't finish it either; "
+               "I'll ask for another wave of %zu Meeseeks.\n",
+               (long)getpid(), (long)getppid(), child_count);
+    }
+}
+
 // Announces this process identity and its level/instance to the user.
 void introduce_meeseeks(const MeeseeksInfo *info)
 {
@@ -290,7 +712,7 @@ int read_message(int fd, TaskMessage *message)
     return 0;
 }
 
-// Runs in a Meeseeks process: prompts for expression type and text, then calls
+// Runs in a Meeseeks process prompting for expression type and text, then calls
 // the matching parser/evaluator and reports either the result or an error.
 int handle_request(const TaskMessage *message)
 {
@@ -366,16 +788,25 @@ int handle_request(const TaskMessage *message)
     return EXIT_SUCCESS;
 }
 
-// Creates a private request pipe and forks one Meeseeks. The parent sends the
-// request and waits; the child reads it, handles it, says goodbye, and exits.
-int create_meeseeks(const TaskMessage *message, MeeseeksInfo info)
+// Creates the root Meeseeks over a private pipe; text-task descendants share
+// semaphore-protected stop/winner state, while Box waits and prints the result.
+int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
+                    SharedTaskState *shared)
 {
     int request_pipe[2];
     pid_t child_pid;
     int status;
 
+    if (shared != NULL && reserve_process_slot(shared) <= 0) {
+        puts("Box: The request could not start within the process limit.");
+        return -1;
+    }
     if (pipe(request_pipe) == -1) {
         perror("Box: pipe");
+        if (shared != NULL && lock_task_state(shared) == 0) {
+            if (shared->created_count > 0) shared->created_count--;
+            (void)unlock_task_state(shared);
+        }
         return -1;
     }
     child_pid = fork();
@@ -383,6 +814,10 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info)
         perror("Box: fork");
         close(request_pipe[0]);
         close(request_pipe[1]);
+        if (shared != NULL && lock_task_state(shared) == 0) {
+            if (shared->created_count > 0) shared->created_count--;
+            (void)unlock_task_state(shared);
+        }
         return -1;
     }
     if (child_pid == 0) {
@@ -398,10 +833,16 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info)
             _exit(EXIT_FAILURE);
         }
         close(request_pipe[0]);
-        int result = handle_request(&child_message);
-        say_goodbye(result == EXIT_SUCCESS
-                    ? "Thanks for the task. I hope I helped!"
-                    : "I couldn't complete the task. Goodbye!");
+        int result = child_message.type == TASK_TEXT
+            ? run_text_task(&child_message, info, shared)
+            : handle_request(&child_message);
+        if (child_message.type == TASK_TEXT) {
+            say_goodbye(text_task_farewell(shared, result));
+        } else {
+            say_goodbye(result == EXIT_SUCCESS
+                        ? "Thanks for the calculation. I hope I helped!"
+                        : "I couldn't complete the calculation. Goodbye!");
+        }
         _exit(result);
     }
 
@@ -419,6 +860,26 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info)
             return -1;
         }
     }
+    if (message->type == TASK_TEXT && shared != NULL) {
+        int reason = task_stop_reason(shared);
+        if (reason == TASK_SOLVED) {
+            printf("Box: Task completed by Meeseeks (pid=%ld, ppid=%ld, N=%u, i=%u).\n",
+                   (long)shared->winner_pid, (long)shared->winner_ppid,
+                   shared->winner_level, shared->winner_instance);
+        } else if (reason == TASK_IMPOSSIBLE) {
+            puts("Box: Difficulty 0 is impossible; no helper processes were created.");
+        } else if (reason == TASK_TIMED_OUT) {
+            printf("Box: Planetary chaos avoided. The %d-second limit expired.\n",
+                   TEXT_TASK_TIMEOUT_SECONDS);
+        } else if (reason == TASK_PROCESS_LIMIT) {
+            puts("Box: The safety limit stopped further Meeseeks creation.");
+        } else {
+            puts("Box: The task could not be completed.");
+        }
+        printf("Box: Meeseeks created for this task: %u (maximum %d).\n",
+               shared->created_count, TEXT_TASK_PROCESS_LIMIT);
+        return reason == TASK_SOLVED ? 0 : -1;
+    }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
         puts("Box: The request was not completed successfully.");
         return -1;
@@ -426,7 +887,7 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info)
     return 0;
 }
 
-// Prints a prompt and reads one bounded line; returns 0 at EOF and -1 if too long.
+// Prints a prompt and reads one bounded line. Returns 0 at EOF and -1 if too long.
 int read_line(const char *prompt, char *buffer, size_t capacity)
 {
     size_t length;
@@ -447,12 +908,89 @@ int read_line(const char *prompt, char *buffer, size_t capacity)
     return 1;
 }
 
-// Displays the CLI menu and starts a Meeseeks for calculation requests.
+// Collects a text task and difficulty, initializes shared controls, and waits for its tree.
+static void start_text_request(void)
+{
+    TaskMessage message = { .type = TASK_TEXT };
+    char difficulty_mode[32];
+    char difficulty_input[64];
+    char *end;
+    int input_result;
+
+    input_result = read_line("Box: What should the Meeseeks do? ",
+                             message.request, sizeof(message.request));
+    if (input_result <= 0) {
+        puts("Box: Couldn't read the task text.");
+        return;
+    }
+    input_result = read_line("Set difficulty: 1) enter 0-100  2) random uniform: ",
+                             difficulty_mode, sizeof(difficulty_mode));
+    if (input_result <= 0) {
+        puts("Box: Couldn't read the difficulty choice.");
+        return;
+    }
+    if (strcmp(difficulty_mode, "1") == 0) {
+        input_result = read_line("Box: Difficulty (0 = impossible, 100 = easiest): ",
+                                 difficulty_input, sizeof(difficulty_input));
+        if (input_result <= 0) {
+            puts("Box: Couldn't read the difficulty value.");
+            return;
+        }
+        errno = 0;
+        message.difficulty = strtod(difficulty_input, &end);
+        while (isspace((unsigned char)*end)) end++;
+        if (end == difficulty_input || *end != '\0' || errno == ERANGE ||
+            !isfinite(message.difficulty) || message.difficulty < 0.0 ||
+            message.difficulty > 100.0) {
+            puts("Box: Difficulty must be a number from 0 to 100.");
+            return;
+        }
+    } else if (strcmp(difficulty_mode, "2") == 0) {
+        message.difficulty = random_percentage();
+        printf("Box: Uniformly selected difficulty %.4f.\n", message.difficulty);
+    } else {
+        puts("Box: Choose 1 for an entered difficulty or 2 for random.");
+        return;
+    }
+
+    SharedTaskState *shared = mmap(NULL, sizeof(*shared),
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        perror("Box: mmap");
+        return;
+    }
+    memset(shared, 0, sizeof(*shared));
+    if (sem_init(&shared->mutex, 1, 1) == -1) {
+        perror("Box: sem_init");
+        (void)munmap(shared, sizeof(*shared));
+        return;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &shared->deadline) == -1) {
+        perror("Box: clock_gettime");
+        (void)sem_destroy(&shared->mutex);
+        (void)munmap(shared, sizeof(*shared));
+        return;
+    }
+    shared->deadline.tv_sec += TEXT_TASK_TIMEOUT_SECONDS;
+    shared->stop_reason = TASK_RUNNING;
+    printf("Box: This task has a %d-second deadline and a %d-process safety cap.\n",
+           TEXT_TASK_TIMEOUT_SECONDS, TEXT_TASK_PROCESS_LIMIT);
+
+    (void)create_meeseeks(&message,
+                          (MeeseeksInfo){ .level = 1, .instance = 1 }, shared);
+    if (sem_destroy(&shared->mutex) == -1) perror("Box: sem_destroy");
+    if (munmap(shared, sizeof(*shared)) == -1) perror("Box: munmap");
+}
+
+// Displays the CLI menu and starts Meeseeks for text-task and calculation requests.
 int main(void)
 {
     char choice[32];
 
     setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    seed_random_generator();
     puts("=== Mr. Meeseeks Box ===");
 
     for (;;) {
@@ -464,12 +1002,15 @@ int main(void)
         puts("  q) Quit anytime");
 
         if (read_line("Box> ", choice, sizeof(choice)) <= 0) break;
-        if (strcmp(choice, "1") == 0 || strcmp(choice, "3") == 0) {
+        if (strcmp(choice, "1") == 0) {
+            start_text_request();
+        } else if (strcmp(choice, "3") == 0) {
             puts("Meeseeks not yet ready.");
         } else if (strcmp(choice, "2") == 0) {
             TaskMessage message = { .type = TASK_CALCULATION };
             (void)create_meeseeks(&message,
-                                  (MeeseeksInfo){ .level = 1, .instance = 1 });
+                                  (MeeseeksInfo){ .level = 1, .instance = 1 },
+                                  NULL);
         } else if (strcmp(choice, "4") == 0 ||
                    strcmp(choice, "q") == 0 || strcmp(choice, "Q") == 0) {
             break;
@@ -478,6 +1019,6 @@ int main(void)
         }
     }
 
-    puts("Box: Goodbye. [resumen de la sesión]");
+    puts("Box: Goodbye.");
     return EXIT_SUCCESS;
 }
