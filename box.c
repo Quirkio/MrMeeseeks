@@ -21,6 +21,7 @@ Carnet: 2024089190
 #include <signal.h>
 #include <semaphore.h>
 #include <time.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -28,11 +29,14 @@ Carnet: 2024089190
 
 #define MAX_REQUEST_LENGTH 1024
 #define MAX_OPERANDS 256
-#define TEXT_TASK_TIMEOUT_SECONDS 300
+#define DEFAULT_BOX_TIMEOUT_SECONDS 300
+#define MAX_BOX_TIMEOUT_SECONDS 86400
+#define MAX_SIMULATION_SECONDS 300
 #define TEXT_TASK_PROCESS_LIMIT 128
 #define TEXT_TASK_MAX_DEPTH 8
 #define DEFAULT_SIMULATION_MIN_SECONDS 0.5
 #define DEFAULT_SIMULATION_MAX_SECONDS 5.0
+#define MAX_COMMAND_ARGUMENTS 64
 
 typedef enum {
     TASK_TEXT = 1,
@@ -69,6 +73,15 @@ typedef struct {
     unsigned int winner_instance;
 } SharedTaskState;
 
+typedef struct {
+    TaskType type;
+    char description[MAX_REQUEST_LENGTH];
+    int completed;
+    unsigned int meeseeks_count;
+    double execution_seconds;
+    int exit_status;
+} RequestReport;
+
 enum {
     TASK_RUNNING,
     TASK_SOLVED,
@@ -79,8 +92,16 @@ enum {
 
 static double simulation_min_seconds = DEFAULT_SIMULATION_MIN_SECONDS;
 static double simulation_max_seconds = DEFAULT_SIMULATION_MAX_SECONDS;
+static unsigned int box_timeout_seconds = DEFAULT_BOX_TIMEOUT_SECONDS;
 static struct timespec box_deadline;
 static volatile sig_atomic_t box_process_group = -1;
+
+// Holds one final outcome row for each request completed during this Box session.
+typedef struct {
+    RequestReport *items;
+    size_t count;
+    size_t capacity;
+} SessionReport;
 
 void introduce_meeseeks(const MeeseeksInfo *info);
 void say_goodbye(const char *message);
@@ -88,7 +109,7 @@ int write_message(int fd, const TaskMessage *message);
 int read_message(int fd, TaskMessage *message);
 int handle_request(const TaskMessage *message);
 int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
-                    SharedTaskState *shared);
+                    SharedTaskState *shared, unsigned int *created_count);
 int read_line(const char *prompt, char *buffer, size_t capacity);
 
 int parse_arithmetic(const char *text, ParsedExpression *parsed,
@@ -101,6 +122,10 @@ int evaluate_logical(const ParsedExpression *parsed, int *result,
                      const char **error);
 int run_text_task(const TaskMessage *message, MeeseeksInfo info,
                   SharedTaskState *shared);
+int run_external_program(const char *command, int *exit_status);
+int parse_command_arguments(const char *command, char *storage,
+                            char **arguments, size_t capacity,
+                            const char **error);
 
 // Reads alternating numeric operands and arithmetic operators into parsed.
 int parse_arithmetic(const char *text, ParsedExpression *parsed,
@@ -287,6 +312,133 @@ int evaluate_logical(const ParsedExpression *parsed, int *result,
     return 0;
 }
 
+// Splits an external command into argv with simple quotes and backslash escapes; never invokes a shell.
+int parse_command_arguments(const char *command, char *storage,
+                            char **arguments, size_t capacity,
+                            const char **error)
+{
+    size_t used = 0;
+    size_t argument_count = 0;
+    const char *cursor = command;
+
+    *error = NULL;
+    while (*cursor != '\0') {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (*cursor == '\0') break;
+        if (argument_count + 1 >= capacity) {
+            *error = "too many command arguments";
+            return -1;
+        }
+
+        arguments[argument_count++] = &storage[used];
+        char quote = '\0';
+        int argument_started = 0;
+        while (*cursor != '\0') {
+            char character = *cursor++;
+            if (quote != '\0') {
+                if (character == quote) {
+                    quote = '\0';
+                    argument_started = 1;
+                    continue;
+                } else if (character == '\\' && quote == '"' &&
+                           (*cursor == '\\' || *cursor == '"')) {
+                    character = *cursor++;
+                }
+            } else if (character == '\'' || character == '"') {
+                quote = character;
+                argument_started = 1;
+                continue;
+            } else if (character == '\\' && *cursor != '\0') {
+                character = *cursor++;
+            } else if (isspace((unsigned char)character)) {
+                break;
+            } else {
+                argument_started = 1;
+            }
+
+            if (used + 1 >= MAX_REQUEST_LENGTH) {
+                *error = "command is too long";
+                return -1;
+            }
+            storage[used++] = character;
+        }
+        if (quote != '\0') {
+            *error = "unclosed quote in command";
+            return -1;
+        }
+        if (!argument_started) {
+            *error = "empty command argument";
+            return -1;
+        }
+        storage[used++] = '\0';
+    }
+    if (argument_count == 0) {
+        *error = "command is empty";
+        return -1;
+    }
+    if (arguments[0][0] == '\0') {
+        *error = "program name is empty";
+        return -1;
+    }
+    arguments[argument_count] = NULL;
+    return 0;
+}
+
+// Forks and execs the requested program without a shell, then returns its exit status.
+int run_external_program(const char *command, int *exit_status)
+{
+    char command_storage[MAX_REQUEST_LENGTH];
+    char *arguments[MAX_COMMAND_ARGUMENTS + 1];
+    const char *error = NULL;
+    pid_t child_pid;
+    int status;
+
+    if (parse_command_arguments(command, command_storage, arguments,
+                                MAX_COMMAND_ARGUMENTS + 1, &error) == -1) {
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): Invalid command: %s.\n",
+               (long)getpid(), (long)getppid(), error);
+        return -1;
+    }
+
+    child_pid = fork();
+    if (child_pid == -1) {
+        perror("Meeseeks: fork external program");
+        return -1;
+    }
+    if (child_pid == 0) {
+        execvp(arguments[0], arguments);
+        fprintf(stderr, "execvp '%s': %s\n", arguments[0], strerror(errno));
+        _exit(127);
+    }
+
+    while (waitpid(child_pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            perror("Meeseeks: waitpid external program");
+            return -1;
+        }
+    }
+    if (WIFEXITED(status)) {
+        *exit_status = WEXITSTATUS(status);
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+               "The program exited with status %d.\n",
+               (long)getpid(), (long)getppid(), *exit_status);
+        return *exit_status == 0 ? 0 : 1;
+    }
+    if (WIFSIGNALED(status)) {
+        *exit_status = 128 + WTERMSIG(status);
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+               "The program was terminated by signal %d.\n",
+               (long)getpid(), (long)getppid(), WTERMSIG(status));
+        return 1;
+    }
+
+    *exit_status = -1;
+    printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+           "The program did not exit normally.\n",
+           (long)getpid(), (long)getppid());
+    return 1;
+}
+
 // Acquires the process-shared lock, retrying if a signal interrupts sem_wait.
 static int lock_task_state(SharedTaskState *shared)
 {
@@ -427,7 +579,7 @@ static double random_percentage(void)
 static void planetary_chaos_handler(int signal_number)
 {
     static const char message[] =
-        "\nBox: Planetary chaos! The five-minute limit expired; terminating Box and all Meeseeks.\n";
+        "\nBox: Planetary chaos! The configured limit expired; terminating Box and all Meeseeks.\n";
     (void)signal_number;
     (void)write(STDERR_FILENO, message, sizeof(message) - 1);
     if (box_process_group > 0) (void)kill(-box_process_group, SIGKILL);
@@ -780,6 +932,17 @@ int handle_request(const TaskMessage *message)
     const char *error = NULL;
     int input_result;
 
+    if (message->type == TASK_EXTERNAL_PROGRAM) {
+        int exit_status;
+        printf("Mr. Meeseeks (pid=%ld, ppid=%ld): "
+               "Executing external program: %s\n",
+               (long)getpid(), (long)getppid(), message->request);
+        int result = run_external_program(message->request, &exit_status);
+        if (result < 0) {
+            return EXIT_FAILURE;
+        }
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (message->type != TASK_CALCULATION) {
         printf("Mr. Meeseeks (pid=%ld, ppid=%ld): Meeseeks not yet ready.\n",
                (long)getpid(), (long)getppid());
@@ -849,12 +1012,13 @@ int handle_request(const TaskMessage *message)
 // Creates the root Meeseeks over a private pipe; text-task descendants share
 // semaphore-protected stop/winner state, while Box waits and prints the result.
 int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
-                    SharedTaskState *shared)
+                    SharedTaskState *shared, unsigned int *created_count)
 {
     int request_pipe[2];
     pid_t child_pid;
     int status;
 
+    *created_count = 0;
     if (shared != NULL && reserve_process_slot(shared) <= 0) {
         puts("Box: The request could not start within the process limit.");
         return -1;
@@ -896,6 +1060,10 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
             : handle_request(&child_message);
         if (child_message.type == TASK_TEXT) {
             say_goodbye(text_task_farewell(shared, result));
+        } else if (child_message.type == TASK_EXTERNAL_PROGRAM) {
+            say_goodbye(result == EXIT_SUCCESS
+                        ? "The external program succeeded. Glad I could help!"
+                        : "The external program failed. Goodbye!");
         } else {
             say_goodbye(result == EXIT_SUCCESS
                         ? "Thanks for the calculation. I hope I helped!"
@@ -904,6 +1072,7 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
         _exit(result);
     }
 
+    *created_count = 1;
     close(request_pipe[0]);
     if (write_message(request_pipe[1], message) == -1) {
         perror("Box: writing request to pipe");
@@ -927,8 +1096,7 @@ int create_meeseeks(const TaskMessage *message, MeeseeksInfo info,
         } else if (reason == TASK_IMPOSSIBLE) {
             puts("Box: Difficulty 0 is impossible; no helper processes were created.");
         } else if (reason == TASK_TIMED_OUT) {
-            printf("Box: Planetary chaos avoided. The %d-second limit expired.\n",
-                   TEXT_TASK_TIMEOUT_SECONDS);
+            puts("Box: The Box-wide planetary chaos deadline expired.");
         } else if (reason == TASK_PROCESS_LIMIT) {
             puts("Box: The safety limit stopped further Meeseeks creation.");
         } else {
@@ -966,6 +1134,86 @@ int read_line(const char *prompt, char *buffer, size_t capacity)
     return 1;
 }
 
+// Converts a resource-usage sample to user-plus-system CPU seconds.
+static double resource_cpu_seconds(const struct rusage *usage)
+{
+    return (double)usage->ru_utime.tv_sec +
+        (double)usage->ru_utime.tv_usec / 1000000.0 +
+        (double)usage->ru_stime.tv_sec +
+        (double)usage->ru_stime.tv_usec / 1000000.0;
+}
+
+// Records the request outcome and cumulative child CPU time, which excludes simulated sleeps.
+static int record_request(SessionReport *report, const TaskMessage *message,
+                          SharedTaskState *shared)
+{
+    struct rusage before = { 0 };
+    struct rusage after = { 0 };
+    int before_ok = getrusage(RUSAGE_CHILDREN, &before) == 0;
+    if (!before_ok) perror("Box: getrusage before request");
+
+    unsigned int created_count = 0;
+    int result = create_meeseeks(message,
+        (MeeseeksInfo){ .level = 1, .instance = 1 }, shared, &created_count);
+
+    int after_ok = getrusage(RUSAGE_CHILDREN, &after) == 0;
+    if (!after_ok) perror("Box: getrusage after request");
+
+    if (report->count == report->capacity) {
+        size_t new_capacity = report->capacity == 0 ? 8 : report->capacity * 2;
+        RequestReport *new_items = realloc(report->items,
+                                            new_capacity * sizeof(*new_items));
+        if (new_items == NULL) {
+            perror("Box: allocating session report");
+            return -1;
+        }
+        report->items = new_items;
+        report->capacity = new_capacity;
+    }
+
+    RequestReport *entry = &report->items[report->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->type = message->type;
+    entry->completed = result == 0;
+    entry->meeseeks_count = shared != NULL
+        ? shared->created_count : created_count;
+    entry->execution_seconds = before_ok && after_ok
+        ? resource_cpu_seconds(&after) - resource_cpu_seconds(&before)
+        : -1.0;
+    entry->exit_status = result == 0 ? 0 : 1;
+    if (message->type == TASK_CALCULATION) {
+        snprintf(entry->description, sizeof(entry->description),
+                 "Arithmetic/logical calculation");
+    } else {
+        snprintf(entry->description, sizeof(entry->description), "%s",
+                 message->request);
+    }
+    return 0;
+}
+
+// Prints one session row per request with status, CPU execution time, and Meeseeks count.
+static void print_session_report(const SessionReport *report)
+{
+    puts("\n=== Box session report ===");
+    printf("Tasks requested: %zu\n", report->count);
+    puts("CPU execution time excludes simulated sleep intervals.");
+    for (size_t i = 0; i < report->count; i++) {
+        const RequestReport *entry = &report->items[i];
+        const char *type = entry->type == TASK_TEXT ? "Text" :
+            entry->type == TASK_CALCULATION ? "Calculation" : "External program";
+        printf("%zu) %s: \"%s\" — %s; ",
+               i + 1, type, entry->description,
+               entry->completed ? "completed" : "not completed");
+        if (entry->execution_seconds >= 0.0) {
+            printf("CPU execution %.6f s; ", entry->execution_seconds);
+        } else {
+            printf("CPU execution unavailable; ");
+        }
+        printf("Meeseeks created: %u; status: %d.\n",
+               entry->meeseeks_count, entry->exit_status);
+    }
+}
+
 // Reads and validates one nonnegative simulation duration in seconds.
 static int read_simulation_seconds(const char *prompt, double *seconds)
 {
@@ -978,8 +1226,9 @@ static int read_simulation_seconds(const char *prompt, double *seconds)
     while (isspace((unsigned char)*end)) end++;
     if (end == input || *end != '\0' || errno == ERANGE ||
         !isfinite(*seconds) || *seconds < 0.0 ||
-        *seconds > TEXT_TASK_TIMEOUT_SECONDS) {
-        puts("Box: Enter a finite duration between 0 and 300 seconds.");
+        *seconds > MAX_SIMULATION_SECONDS) {
+        printf("Box: Enter a finite duration between 0 and %d seconds.\n",
+               MAX_SIMULATION_SECONDS);
         return -1;
     }
     return 0;
@@ -1027,8 +1276,43 @@ static void configure_simulation_time(void)
     }
 }
 
+// Sets the universal timeout to at least five minutes and restarts its countdown.
+static void configure_box_timeout(void)
+{
+    char input[64];
+    char *end;
+    unsigned long minutes;
+
+    if (read_line("Box: Planetary chaos timeout in minutes (5-1440): ",
+                  input, sizeof(input)) <= 0) {
+        puts("Box: Couldn't read the timeout.");
+        return;
+    }
+    errno = 0;
+    minutes = strtoul(input, &end, 10);
+    while (isspace((unsigned char)*end)) end++;
+    if (end == input || *end != '\0' || errno == ERANGE ||
+        minutes < 5 || minutes > MAX_BOX_TIMEOUT_SECONDS / 60) {
+        printf("Box: Enter a whole number of minutes from 5 to %d.\n",
+               MAX_BOX_TIMEOUT_SECONDS / 60);
+        return;
+    }
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        perror("Box: clock_gettime");
+        return;
+    }
+    box_timeout_seconds = (unsigned int)(minutes * 60);
+    box_deadline = now;
+    box_deadline.tv_sec += box_timeout_seconds;
+    alarm(box_timeout_seconds);
+    printf("Box: Planetary chaos timeout set to %lu minutes; countdown restarted.\n",
+           minutes);
+}
+
 // Collects a text task and difficulty, initializes shared controls, and waits for its tree.
-static void start_text_request(void)
+static void start_text_request(SessionReport *report)
 {
     TaskMessage message = { .type = TASK_TEXT };
     char difficulty_mode[32];
@@ -1088,12 +1372,11 @@ static void start_text_request(void)
     shared->deadline = box_deadline;
     shared->stop_reason = TASK_RUNNING;
     printf("Box: Simulation duration is %.3f-%.3f seconds; this request shares "
-           "the Box five-minute deadline and has a %d-process safety cap.\n",
+           "the Box-wide deadline and has a %d-process safety cap.\n",
            simulation_min_seconds, simulation_max_seconds,
            TEXT_TASK_PROCESS_LIMIT);
 
-    (void)create_meeseeks(&message,
-                          (MeeseeksInfo){ .level = 1, .instance = 1 }, shared);
+    (void)record_request(report, &message, shared);
     if (sem_destroy(&shared->mutex) == -1) perror("Box: sem_destroy");
     if (munmap(shared, sizeof(*shared)) == -1) perror("Box: munmap");
 }
@@ -1103,6 +1386,7 @@ int main(void)
 {
     char choice[32];
     struct sigaction chaos_action = { 0 };
+    SessionReport report = { 0 };
 
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1115,14 +1399,14 @@ int main(void)
         perror("Box: clock_gettime");
         return EXIT_FAILURE;
     }
-    box_deadline.tv_sec += TEXT_TASK_TIMEOUT_SECONDS;
+    box_deadline.tv_sec += box_timeout_seconds;
     chaos_action.sa_handler = planetary_chaos_handler;
     sigemptyset(&chaos_action.sa_mask);
     if (sigaction(SIGALRM, &chaos_action, NULL) == -1) {
         perror("Box: sigaction");
         return EXIT_FAILURE;
     }
-    alarm(TEXT_TASK_TIMEOUT_SECONDS);
+    alarm(box_timeout_seconds);
     seed_random_generator();
     puts("=== Mr. Meeseeks Box ===");
 
@@ -1133,29 +1417,43 @@ int main(void)
         puts("  3) External program");
         puts("  4) Quit");
         puts("  5) Configure simulation duration");
+        puts("  6) Configure planetary chaos timeout");
         puts("  q) Quit anytime");
         print_time_remaining();
 
         if (read_line("Box> ", choice, sizeof(choice)) <= 0) break;
         if (strcmp(choice, "1") == 0) {
-            start_text_request();
+            start_text_request(&report);
         } else if (strcmp(choice, "3") == 0) {
-            puts("Meeseeks not yet ready.");
+            TaskMessage message = { .type = TASK_EXTERNAL_PROGRAM };
+            int input_result = read_line(
+                "Box: Enter program and arguments (quotes supported; no shell): ",
+                message.request, sizeof(message.request));
+            if (input_result <= 0 || message.request[0] == '\0') {
+                puts("Box: Please enter a non-empty command within the length limit.");
+            } else {
+                (void)record_request(&report, &message, NULL);
+            }
         } else if (strcmp(choice, "2") == 0) {
-            TaskMessage message = { .type = TASK_CALCULATION };
-            (void)create_meeseeks(&message,
-                                  (MeeseeksInfo){ .level = 1, .instance = 1 },
-                                  NULL);
+            TaskMessage message = {
+                .type = TASK_CALCULATION,
+                .request = "Arithmetic/logical calculation"
+            };
+            (void)record_request(&report, &message, NULL);
         } else if (strcmp(choice, "5") == 0) {
             configure_simulation_time();
+        } else if (strcmp(choice, "6") == 0) {
+            configure_box_timeout();
         } else if (strcmp(choice, "4") == 0 ||
                    strcmp(choice, "q") == 0 || strcmp(choice, "Q") == 0) {
             break;
         } else {
-            puts("Box: Please choose 1, 2, 3, 4, 5, or q.");
+            puts("Box: Please choose 1, 2, 3, 4, 5, 6, or q.");
         }
     }
 
+    print_session_report(&report);
+    free(report.items);
     puts("Box: Goodbye.");
     return EXIT_SUCCESS;
 }
